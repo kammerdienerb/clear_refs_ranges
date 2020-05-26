@@ -1,0 +1,9 @@
+.yedrc
+test
+*.o
+*.ko
+*.symvers
+*.order
+*.mod.*
+*.cmd
+.tmp_versions
