@@ -1,0 +1,4 @@
+vimish-bind normal ctrl-y   CMD less "./build.sh && rmmod clear_refs_ranges"
+vimish-bind normal ctrl-m i CMD sh "sync && insmod clear_refs_ranges.ko && echo Module inserted."
+vimish-bind normal ctrl-m r CMD sh "sync && rmmod  clear_refs_ranges    && echo Module removed."
+style-term-bg sammy
