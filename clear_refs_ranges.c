@@ -86,14 +86,18 @@ static int crr(struct clear_refs_ranges_info *info) {
     struct mm_struct      *mm;
     struct vm_area_struct *vma;
     unsigned long long     vpage;
-    pte_t                  pte,
+    pte_t                  old_pte,
+                           pte,
                           *ptep;
 
     status = 0;
     mm     = NULL;
 
-    if ((status = get_mm(info, &mm)) || !mm) { goto out;                 }
-    if (!mm->mmap)                           { DBUG("mm has no mmap\n"); }
+    if ((status = get_mm(info, &mm)) || !mm) { goto out; }
+
+    down_write(&mm->mmap_sem);
+
+    if (!mm->mmap) { DBUG("mm has no mmap\n"); }
 
     vma = NULL;
 
@@ -112,25 +116,18 @@ static int crr(struct clear_refs_ranges_info *info) {
             pte = *ptep;
 
             if (pte_present(pte)) {
-                if (pte_dirty(pte)) {
-                    pte = pte_mkdirty(pte);
-                }
-                if (pte_young(pte)) {
-                    pte = pte_mkyoung(pte);
-                }
-                pte = pte_wrprotect(pte);
+                old_pte = ptep_modify_prot_start(vma, vpage, ptep);
+                pte = pte_wrprotect(old_pte);
                 pte = pte_clear_soft_dirty(pte);
-
-                set_pte(ptep, pte);
-            } else if (is_migration_entry(pte_to_swp_entry(pte))) {
+                ptep_modify_prot_commit(vma, vpage, ptep, old_pte, pte);
+            } else if (is_swap_pte(pte)) {
                 pte = pte_swp_clear_soft_dirty(pte);
-
-                set_pte(ptep, pte);
+                set_pte_at(vma->vm_mm, vpage, ptep, pte);
             }
-
-            pte_unmap(ptep);
         }
     }
+
+    up_write(&mm->mmap_sem);
 
 out:
     return status;
@@ -148,7 +145,7 @@ out:
 struct proc_dir_entry *pf_ent;
 
 static ssize_t pf_w(struct file *file, const char *buf, size_t count, loff_t *ppos) {
-    struct clear_refs_ranges_info *info;
+    struct clear_refs_ranges_info *info_p, info;
     int                            status;
 
     if (count != sizeof(struct clear_refs_ranges_info)) {
@@ -156,26 +153,30 @@ static ssize_t pf_w(struct file *file, const char *buf, size_t count, loff_t *pp
         return -EINVAL;
     }
 
-    info = (struct clear_refs_ranges_info*)buf;
+    info_p = (struct clear_refs_ranges_info*)buf;
 
-    if (info->_magic != CLEAR_REFS_MAGIC) {
+    if (copy_from_user(&info, info_p, sizeof(info)) != 0) {
+        DBUG("error copying info from user space to kernel space\n");
+        return -EFAULT;
+    }
+
+    if (info._magic != CLEAR_REFS_MAGIC) {
         DBUG("write payload has incorrect magic value\n");
         return -EINVAL;
     }
 
-
-    if (info->range_end <= info->range_start) {
+    if (info.range_end <= info.range_start) {
         DBUG("range_end >= range_start\n");
         return -EINVAL;
     }
 
-    if (((unsigned long long)info->range_start) & (PAGE_SIZE - 1)
-    ||  ((unsigned long long)info->range_end)   & (PAGE_SIZE - 1)) {
+    if (((unsigned long long)info.range_start) & (PAGE_SIZE - 1)
+    ||  ((unsigned long long)info.range_end)   & (PAGE_SIZE - 1)) {
         DBUG("misaligned range value(s)\n");
         return -EINVAL;
     }
 
-    status = crr(info);
+    status = crr(&info);
     if (status < 0) {
         DBUG("there was an error\n");
         return status;
