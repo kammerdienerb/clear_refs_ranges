@@ -290,7 +290,6 @@ static ssize_t pf_w(struct file *file, const char *buf, size_t count, loff_t *pp
 /* https://patchwork.kernel.org/patch/11363867 */
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(5,6,0)
 static const struct file_operations pf_ops = {
-    .owner = THIS_MODULE,
     .write = pf_w,
 };
 #else
