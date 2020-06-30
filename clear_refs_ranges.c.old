@@ -10,7 +10,10 @@
 #include <linux/pid_namespace.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
-#include <linux/mempolicy.h>
+
+#define DRIVER_AUTHOR "Brandon Kammerdiener <bkammerd@vols.utk.edu>"
+#define DRIVER_DESC   "Extend the clear_refs /proc functionality to page ranges"
+
 
 #define CLEAR_REFS_MAGIC (0xC1EA77EF)
 
@@ -78,134 +81,34 @@ static pte_t * vpage_to_pte(struct mm_struct *mm, unsigned long vpage) {
     return pte;
 }
 
-static int crr_vma(struct clear_refs_ranges_info *info, struct vm_area_struct *vma, struct vm_area_struct **prev, unsigned long start, unsigned long end) {
-	struct mm_struct *mm;
-	int               error;
-	unsigned long     new_flags;
-	pgoff_t           pgoff;
-
-    mm        = vma->vm_mm;
-    error     = 0;
-    new_flags = vma->vm_flags & ~VM_SOFTDIRTY;
-
-    if (new_flags == vma->vm_flags) {
-        *prev = vma;
-        goto out;
-    }
-
-    pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
-    *prev = vma_merge(mm, *prev, start, end, new_flags, vma->anon_vma,
-                      vma->vm_file, pgoff, vma_policy(vma),
-                      vma->vm_userfaultfd_ctx);
-    if (*prev) {
-        vma = *prev;
-        goto success;
-    }
-
-    *prev = vma;
-
-	if (start != vma->vm_start) {
-		if (unlikely(mm->map_count >= sysctl_max_map_count)) {
-			error = -ENOMEM;
-			goto out;
-		}
-
-		if ((error = __split_vma(mm, vma, start, 1))) { goto out; }
-	}
-
-	if (end != vma->vm_end) {
-		if (unlikely(mm->map_count >= sysctl_max_map_count)) {
-			error = -ENOMEM;
-			goto out;
-		}
-		if ((error = __split_vma(mm, vma, end, 0))) { goto out; }
-	}
-
-success:
-    vma->vm_flags = new_flags;
-
-out:
-    return error;
-}
-
 static int crr(struct clear_refs_ranges_info *info) {
     int                    status;
     struct mm_struct      *mm;
     struct vm_area_struct *vma;
-    struct vm_area_struct *prev;
-    unsigned long long     start;
-    unsigned long long     end;
-    unsigned long long     tmp;
-    int                    did_down_write;
     unsigned long long     vpage;
-    pte_t                  pte,
+    pte_t                  old_pte,
+                           pte,
                           *ptep;
 
-    status         = 0;
-    mm             = NULL;
-    did_down_write = 0;
+    status = 0;
+    mm     = NULL;
 
     if ((status = get_mm(info, &mm)) || !mm) { goto out; }
 
     down_write(&mm->mmap_sem);
-    did_down_write = 1;
 
     if (!mm->mmap) { DBUG("mm has no mmap\n"); }
 
-    start = (unsigned long long)info->range_start;
-    end   = (unsigned long long)info->range_end;
-
-    /*
-     * If the interval [start,end) covers some unmapped address
-     * ranges, just ignore them, but return -ENOMEM at the end.
-     * - different from the way of handling in mlock etc.
-     */
-    vma = find_vma_prev(mm, start, &prev);
-    if (vma && start > vma->vm_start) {
-        prev = vma;
-    }
-
-    for (;;) {
-        /* Still start < end. */
-        status = -ENOMEM;
-
-        if (!vma) { goto out; }
-
-        /* Here start < (end|vma->vm_end). */
-        if (start < vma->vm_start) {
-            start = vma->vm_start;
-            if (start >= end) { goto do_ptes; }
-        }
-
-        /* Here vma->vm_start <= start < (end|vma->vm_end) */
-        tmp = vma->vm_end;
-        if (end < tmp) { tmp = end; }
-
-        /* Here vma->vm_start <= start < tmp <= (end|vma->vm_end). */
-        status = crr_vma(info, vma, &prev, start, tmp);
-
-        if (status) { goto out; }
-
-        start = tmp;
-
-        if (prev && start < prev->vm_end) {
-            start = prev->vm_end;
-        }
-
-        if (start >= end) { goto do_ptes; }
-
-        if (prev) {
-            vma = prev->vm_next;
-        } else {
-            vma = find_vma(mm, start);
-        }
-    }
-
-do_ptes:
+    vma = NULL;
 
     for (vpage = (unsigned long long)info->range_start;
          vpage < (unsigned long long)info->range_end;
          vpage += PAGE_SIZE) {
+
+        /* Get the correct vma for the page. */
+        if (!vma || vpage < vma->vm_start || vpage >= vma->vm_end) {
+            vma = find_vma(mm, vpage);
+        }
 
         ptep = vpage_to_pte(mm, vpage);
 
@@ -213,9 +116,10 @@ do_ptes:
             pte = *ptep;
 
             if (pte_present(pte)) {
-                pte = pte_wrprotect(pte);
+                old_pte = ptep_modify_prot_start(vma, vpage, ptep);
+                pte = pte_wrprotect(old_pte);
                 pte = pte_clear_soft_dirty(pte);
-                set_pte_at(vma->vm_mm, vpage, ptep, pte);
+                ptep_modify_prot_commit(vma, vpage, ptep, old_pte, pte);
             } else if (is_swap_pte(pte)) {
                 pte = pte_swp_clear_soft_dirty(pte);
                 set_pte_at(vma->vm_mm, vpage, ptep, pte);
@@ -223,9 +127,9 @@ do_ptes:
         }
     }
 
-out:
-    if (did_down_write) { up_write(&mm->mmap_sem); }
+    up_write(&mm->mmap_sem);
 
+out:
     return status;
 }
 
@@ -274,12 +178,7 @@ static ssize_t pf_w(struct file *file, const char *buf, size_t count, loff_t *pp
 
     status = crr(&info);
     if (status < 0) {
-        DBUG("there was an error -- %d\n", status);
-        if (status == -12) {
-            DBUG("it is likely that the cause of the error was due "
-                 "to an input range that covered non-mapped memory\n",
-                 status);
-        }
+        DBUG("there was an error\n");
         return status;
     }
 
@@ -303,6 +202,8 @@ static const struct proc_ops pf_ops = {
 
 
 
+
+
 static int __init init_clear_refs_ranges(void) {
     pf_ent = proc_create("clear_refs_ranges", 0660, NULL, &pf_ops);
 
@@ -313,4 +214,16 @@ static int __init init_clear_refs_ranges(void) {
     return 0;
 }
 
-fs_initcall(init_clear_refs_ranges);
+static void __exit cleanup_clear_refs_ranges(void) {
+    proc_remove(pf_ent);
+
+    INFO("cleaned up\n");
+}
+
+
+module_init(init_clear_refs_ranges);
+module_exit(cleanup_clear_refs_ranges);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR(DRIVER_AUTHOR);
+MODULE_DESCRIPTION(DRIVER_DESC);
