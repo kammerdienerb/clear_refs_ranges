@@ -17,6 +17,8 @@ int crr_close(struct crr_t *crr);
 int crr_range(struct crr_t *crr, void *start, void *end);
 int crr_range_immediate(void *start, void *end);
 
+#endif
+
 #ifdef CLEAR_REFS_RANGES_IMPL
 
 /*
@@ -135,7 +137,5 @@ int crr_range_immediate(void *start, void *end) {
 out:
     return status;
 }
-
-#endif
 
 #endif
